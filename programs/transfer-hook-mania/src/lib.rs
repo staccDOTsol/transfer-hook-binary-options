@@ -478,6 +478,7 @@ pub struct InitializeExtraAccountMetaList<'info> {
 // Remaining accounts are the extra accounts required from the ExtraAccountMetaList account
 // These accounts are provided via CPI to this program from the token2022 program
 
+
 #[derive(Accounts)]
 pub struct TransferHook<'info> {
     #[account(
