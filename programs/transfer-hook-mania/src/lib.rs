@@ -117,22 +117,6 @@ pub mod transfer_hook {
 
     use super::*;
 
-    pub fn initialize_volatility_index(
-        ctx: Context<InitializeVolatilityIndex>,
-        up_threshold: u64,
-        down_threshold: u64,
-    ) -> Result<()> {
-        let volatility_index = &mut ctx.accounts.volatility_index;
-        volatility_index.price_history = [0; 24];
-        volatility_index.current_index = 0;
-        volatility_index.last_update_time = Clock::get()?.unix_timestamp;
-        volatility_index.volatility = 0;
-        volatility_index.up_threshold = up_threshold;
-        volatility_index.down_threshold = down_threshold;
-        volatility_index.sol_mint = ctx.accounts.sol_mint.key();
-
-        Ok(())
-    }
     pub fn initialize_extra_account_meta_list(
         ctx: Context<InitializeExtraAccountMetaList>,
         up_threshold: u64,
@@ -270,7 +254,7 @@ pub mod transfer_hook {
     }
 
     pub fn burn_baby_burn(ctx: Context<BurnBabyBurn>, amount: u64) -> Result<()> {
-        let signer_seeds: &[&[u8]] = &[&[b"game", ctx.accounts.mint.to_account_info().key.as_ref(), &[ctx.bumps.game]]];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"game", ctx.accounts.mint.to_account_info().key.as_ref(), &[ctx.bumps.game]]];
         let ix = spl_token_2022::instruction::burn_checked(
             &spl_token_2022::ID,
             &ctx.accounts.mint.key(),
@@ -302,7 +286,6 @@ pub mod transfer_hook {
         let adjusted_payout = (payout as f64 * reward_multiplier).round() as u64;
 
         game.total_pending_payout -= adjusted_payout;
-        let signer_seeds: &[&[u8]] = &[&[b"game", ctx.accounts.mint.to_account_info().key.as_ref(), &[ctx.bumps.game]]];
 
         let ix = spl_token_2022::instruction::withdraw_excess_lamports(
             &spl_token_2022::ID,
@@ -347,12 +330,12 @@ pub mod transfer_hook {
     
         let volatility_index = &mut ctx.accounts.volatility_index;
         let current_time = unix_timestamp;
-    
+        let index = volatility_index.current_index;
         // Update only if an hour has passed
         if current_time - volatility_index.last_update_time >= 3600 {
             // Update price history
-            volatility_index.price_history[volatility_index.current_index] = price;
-            volatility_index.current_index = (volatility_index.current_index + 1) % 24;
+            volatility_index.price_history[index] = price;
+            volatility_index.current_index = (index + 1) % 24;
     
             // Calculate volatility
             let (min_price, max_price) = volatility_index.price_history.iter()
@@ -426,6 +409,12 @@ pub struct OmNomNom<'info> {
     #[account(mut)]
     pub mint: InterfaceAccount<'info, Mint>,
     pub token_program: Program<'info, Token2022>,
+    #[account(
+        mut,
+        seeds = [b"volatility-index", mint.key().as_ref()],
+        bump
+    )]
+    pub volatility_index: Account<'info, VolatilityIndex>,
 }
 #[derive(Accounts)]
 pub struct BurnBabyBurn<'info> {
@@ -438,6 +427,12 @@ pub struct BurnBabyBurn<'info> {
     #[account(mut, seeds = [b"game", mint.key().as_ref()], bump)]
     pub game: Account<'info, Game>,
     pub token_program: Program<'info, Token2022>,
+    #[account(
+        mut,
+        seeds = [b"volatility-index", mint.key().as_ref()],
+        bump
+    )]
+    pub volatility_index: Account<'info, VolatilityIndex>,
 }
 
 #[derive(Accounts)]
