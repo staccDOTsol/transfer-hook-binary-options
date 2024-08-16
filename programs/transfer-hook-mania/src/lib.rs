@@ -16,6 +16,7 @@ use spl_transfer_hook_interface::instruction::{ExecuteInstruction, TransferHookI
 
 pub const RAYDIUM_POOL_LEN: usize = 1544;
 pub const RAYDIUM_POOL_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
+pub const SOL_LAMPORTS: u64 = 1_000_000_000; // 1 SOL in lamports
 
 pub mod raydium_mainnet {
     use solana_program::declare_id;
@@ -58,18 +59,6 @@ impl CLMMPoolState {
 }
 
 
-
-#[account]
-pub struct VolatilityIndex {
-    pub price_history: [u64; 24],  // Store last 24 hourly prices
-    pub current_index: usize,      // Current index in the price history array
-    pub last_update_time: i64,     // Last update timestamp
-    pub volatility: u64,           // Current volatility (as a percentage, multiplied by 100)
-    pub up_threshold: u64,         // Threshold for up volatility (percentage * 100)
-    pub down_threshold: u64,       // Threshold for down volatility (percentage * 100)
-    pub sol_mint: Pubkey,          // SOL mint address
-}
-
 pub fn load_raydium_pool_state<'info>(acc_info: &AccountInfo<'info>) -> Result<CLMMPoolState> {
     let data: &[u8] = &acc_info.data.try_borrow().unwrap();
     require!(
@@ -100,38 +89,78 @@ pub fn load_raydium_pool_state<'info>(acc_info: &AccountInfo<'info>) -> Result<C
 }
 #[account]
 pub struct Game {
-    pub this_mint_won: bool, // 1
-    pub this_mint_ate_the_other_already: bool, // +1=2
-    pub total_pending_payout: u64, // +8=10
-    pub next_epoch: u64, // +8=18
-    pub last_epoch: u64, // +8=26
-    pub last_price: u64, // +8=34
-    pub other_mint: Pubkey, // +32=42
+    pub last_price: u64,
+    pub other_mint: Pubkey,
+    pub leverage: u64,
+    pub creator: Pubkey,
+    pub t22_reserve: Pubkey,
+    pub lst_reserve: Pubkey,
+    pub sol_reserve: Pubkey,
+    pub t22_sol_pool: Pubkey,
+    pub lst_sol_pool: Pubkey,
+    pub t22_lst_pool: Pubkey,
+}
+
+impl Game {
+    pub fn calculate_price_ratio(&self, current_price: u64, is_short: bool) -> f64 {
+        let price_change = (current_price as f64 - self.last_price as f64) / self.last_price as f64;
+        let leveraged_change = price_change * self.leverage as f64;
+        
+        if is_short {
+            1.0 - leveraged_change
+        } else {
+            1.0 + leveraged_change
+        }
+    }
+
+    pub fn calculate_payout(&self, amount: u64, current_price: u64, is_short: bool) -> u64 {
+        let price_ratio = self.calculate_price_ratio(current_price, is_short);
+        (amount as f64 * price_ratio).round() as u64
+    }
 }
 declare_id!("AZR4kEoxHrD879oPU5vLbJnryCHEyrJfiFwmASUXdFqf");
 
 #[program]
 pub mod transfer_hook {
-
-    use solana_program::{program::{invoke, invoke_signed}, system_instruction::transfer};
-
+    use anchor_spl::token_2022::{mint_to, MintTo};
+    use solana_program::{program::{invoke, invoke_signed}, system_instruction};
     use super::*;
-
+    pub fn initialize_game(
+        ctx: Context<InitializeGame>,
+        leverage: u64,
+        amount: u64,
+        t22_reserve: Pubkey,
+        lst_reserve: Pubkey,
+        sol_reserve: Pubkey,
+        t22_sol_pool: Pubkey,
+        lst_sol_pool: Pubkey,
+        t22_lst_pool: Pubkey,
+    ) -> Result<()> {
+        let game = &mut ctx.accounts.game;
+        game.creator = ctx.accounts.payer.key();
+        game.last_price = 0; // Initialize with a default value
+        game.other_mint = ctx.accounts.other_mint.key();
+        game.leverage = leverage;
+        game.t22_reserve = t22_reserve;
+        game.lst_reserve = lst_reserve;
+        game.sol_reserve = sol_reserve;
+        game.t22_sol_pool = t22_sol_pool;
+        game.lst_sol_pool = lst_sol_pool;
+        game.t22_lst_pool = t22_lst_pool;
+    
+        Ok(())
+    }
     pub fn initialize_extra_account_meta_list(
         ctx: Context<InitializeExtraAccountMetaList>,
-        up_threshold: u64,
-        down_threshold: u64,
+        leverage: u64,
+        amount: u64
     ) -> Result<()> {
-        // index 0-3 are the accounts required for token transfer (source, mint, destination, owner)
-        // index 4 is address of ExtraAccountMetaList account
         let account_metas = vec![
-            // index 5, wrapped SOL mint
             ExtraAccountMeta::new_with_pubkey(&ctx.accounts.other_mint.key(), false, false)?,
             ExtraAccountMeta::new_with_pubkey(&ctx.accounts.game.key(), false, true)?,
-            ExtraAccountMeta::new_with_pubkey(&ctx.accounts.volatility_index.key(), false, true)?,
             ExtraAccountMeta::new_with_pubkey(&ctx.accounts.raydium_clmm.key(), false, false)?,
         ];
-    
+
         let ix = spl_token_2022::instruction::set_authority(
             &spl_token_2022::ID,
             &ctx.accounts.other_mint.key(),
@@ -140,7 +169,7 @@ pub mod transfer_hook {
             &ctx.accounts.payer.key(),
             &[]
         )?;
-    
+
         let accounts = vec![
             ctx.accounts.payer.to_account_info(),
             ctx.accounts.other_mint.to_account_info(),
@@ -148,20 +177,17 @@ pub mod transfer_hook {
             ctx.accounts.raydium_clmm.to_account_info(),
         ];
         invoke(&ix, &accounts)?;
-    
-        // calculate account size
+
         let account_size = ExtraAccountMetaList::size_of(account_metas.len())? as u64;
-        // calculate minimum required lamports
         let lamports = Rent::get()?.minimum_balance(account_size as usize);
-    
+
         let mint = ctx.accounts.mint.key();
         let signer_seeds: &[&[&[u8]]] = &[&[
             b"extra-account-metas",
             &mint.as_ref(),
             &[ctx.bumps.extra_account_meta_list],
         ]];
-    
-        // create ExtraAccountMetaList account
+
         create_account(
             CpiContext::new(
                 ctx.accounts.system_program.to_account_info(),
@@ -175,81 +201,106 @@ pub mod transfer_hook {
             account_size,
             ctx.program_id,
         )?;
-    
+
         let clmm = &ctx.accounts.raydium_clmm;
         let clmm_state = load_raydium_pool_state(clmm)?;
         let unix_timestamp = Clock::get()?.unix_timestamp;
-    
-        // Initialize game account
+
         let game = &mut ctx.accounts.game;
-        game.this_mint_won = false;
-        game.this_mint_ate_the_other_already = false;
-        game.total_pending_payout = 0;
-        game.next_epoch = (unix_timestamp + 24 * 3600) as u64;
-        game.last_epoch = unix_timestamp as u64;
+        game.creator = ctx.accounts.payer.key();
         game.last_price = clmm_state.get_clmm_price().to_num::<u64>();
         game.other_mint = ctx.accounts.other_mint.key();
-    
-        // Initialize volatility index account
-        let volatility_index = &mut ctx.accounts.volatility_index;
-        volatility_index.price_history = [0; 24];
-        volatility_index.current_index = 0;
-        volatility_index.last_update_time = unix_timestamp;
-        volatility_index.volatility = 0;
-        volatility_index.up_threshold = up_threshold;
-        volatility_index.down_threshold = down_threshold;
-        volatility_index.sol_mint = ctx.accounts.mint.key();
-    
-        // initialize ExtraAccountMetaList account with extra accounts
+        game.leverage = leverage;
+        let initial_liquidity = amount as f64 / 1.0;
+
+
+        // Transfer initial liquidity to the pool
+        let transfer_a = system_instruction::transfer(
+            &ctx.accounts.payer.key(),
+            &ctx.accounts.game.key(),
+            initial_liquidity_a,
+        );
+        invoke(
+            &transfer_a,
+            &[
+                ctx.accounts.payer.to_account_info(),
+                ctx.accounts.game.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+
+        let transfer_b = system_instruction::transfer(
+            &ctx.accounts.payer.key(),
+            &ctx.accounts.game.key(),
+            initial_liquidity_b,
+        );
+        invoke(
+            &transfer_b,
+            &[
+                ctx.accounts.payer.to_account_info(),
+                ctx.accounts.game.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+
+        // Initialize the pool state
+        let pool_state = CLMMPoolState {
+            sqrt_price: clmm_state.sqrt_price,
+            token_mint_a: clmm_state.token_mint_a,
+            token_mint_b: clmm_state.token_mint_b,
+        };
+        let pool = Pool {
+            state: pool_state,
+            last_price: clmm_state.get_clmm_price().to_num::<u64>(),
+            fee_percentage,
+        };
+        game.pools.push(pool);
+
         ExtraAccountMetaList::init::<ExecuteInstruction>(
             &mut ctx.accounts.extra_account_meta_list.try_borrow_mut_data()?,
             &account_metas,
         )?;
-    
+
         Ok(())
     }
-    
-    
-    pub fn om_nom_nom(ctx: Context<OmNomNom>) -> Result<()> {
-        require!(ctx.accounts.game.this_mint_won, TransferHookError::InvalidCLMMOracle);
+
+    pub fn mint_sol_tokens(ctx: Context<MintSolTokens>, amount: u64, is_short: bool) -> Result<()> {
+        let game = &ctx.accounts.game;
+        let current_price = load_raydium_pool_state(&ctx.accounts.raydium_clmm)?.get_clmm_price().to_num::<u64>();
+        
+        let tokens_to_mint = game.calculate_payout(amount, current_price, is_short);
         let signer_seeds: &[&[&[u8]]] = &[&[b"game", ctx.accounts.mint.to_account_info().key.as_ref(), &[ctx.bumps.game]]];
 
-        let ix = spl_token_2022::instruction::withdraw_excess_lamports(
-            &spl_token_2022::ID,
-            &ctx.accounts.other_mint.key(),
-            &ctx.accounts.mint.key(),
-            &ctx.accounts.game.key(),
-            &[]
+        // Mint tokens 
+
+        mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    authority: ctx.accounts.game.to_account_info(),
+                    to: ctx.accounts.destination.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            tokens_to_mint,
         )?;
-        let accounts = vec![
-            ctx.accounts.payer.to_account_info(),
-            ctx.accounts.other_mint.to_account_info(),
-            ctx.accounts.mint.to_account_info(),
-            ctx.accounts.game.to_account_info(),
-        ];
-        invoke_signed(&ix, &accounts, signer_seeds)?;
 
-        let game = &mut ctx.accounts.game;
-        let volatility_index = &ctx.accounts.volatility_index;
-
-        // Calculate the reward multiplier based on volatility
-        let reward_multiplier = calculate_reward_multiplier(volatility_index.volatility, volatility_index.up_threshold, volatility_index.down_threshold);
-
-        // Apply the reward multiplier to the payout
-        let lamports = ctx.accounts.mint.get_lamports();
-        let payout = (lamports as f64 * reward_multiplier).round() as u64;
-
-        game.this_mint_won = false;
-        game.this_mint_ate_the_other_already = true;
-        
-        // Transfer the payout
-        let transfer_ix = transfer(
+        let lamports_to_transfer = amount;
+        let transfer_instruction = system_instruction::transfer(
             &ctx.accounts.payer.key(),
-            &ctx.accounts.mint.key(),
-            payout,
+            &ctx.accounts.game.key(),
+            lamports_to_transfer
         );
-        invoke(&transfer_ix, &accounts)?;
-        
+        invoke(
+            &transfer_instruction,
+            &[
+                ctx.accounts.payer.to_account_info(),
+                ctx.accounts.game.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+
         Ok(())
     }
 
@@ -272,21 +323,11 @@ pub mod transfer_hook {
         invoke_signed(&ix, &accounts, signer_seeds)?;
 
         let game = &mut ctx.accounts.game;
-        let lamports = ctx.accounts.mint.get_lamports();
-        let supply = ctx.accounts.mint.supply;
-        let amount_of_supply: f64 = amount as f64 / supply as f64;
-        let payout = (amount_of_supply * lamports as f64).round() as u64;
-
-        let volatility_index = &ctx.accounts.volatility_index;
-
-        // Calculate the reward multiplier based on volatility
-        let reward_multiplier = calculate_reward_multiplier(volatility_index.volatility, volatility_index.up_threshold, volatility_index.down_threshold);
-
-        // Apply the reward multiplier to the payout
-        let adjusted_payout = (payout as f64 * reward_multiplier).round() as u64;
-
-        game.total_pending_payout -= adjusted_payout;
-
+        let current_price = load_raydium_pool_state(&ctx.accounts.raydium_clmm)?.get_clmm_price().to_num::<u64>();
+    
+        let is_short = ctx.accounts.mint.key() < ctx.accounts.other_mint.key();
+        let payout = game.calculate_payout(amount, current_price, is_short);
+    
         let ix = spl_token_2022::instruction::withdraw_excess_lamports(
             &spl_token_2022::ID,
             &ctx.accounts.mint.key(),
@@ -295,73 +336,26 @@ pub mod transfer_hook {
             &[]
         )?;
         invoke_signed(&ix, &accounts, signer_seeds)?;
+        let game_account = ctx.accounts.game.to_account_info();
+        let payer_account = ctx.accounts.payer.to_account_info();
 
-        let transfer_back_ix = transfer(
-            &ctx.accounts.payer.key(),
-            &ctx.accounts.mint.key(),
-            lamports as u64 - adjusted_payout,
-        );
-        invoke(&transfer_back_ix, &accounts)?;
+        **game_account.try_borrow_mut_lamports()? -= payout;
+        **payer_account.try_borrow_mut_lamports()? += payout;
 
         Ok(())
     }
 
     pub fn transfer_hook(ctx: Context<TransferHook>, _amount: u64) -> Result<()> {
-        let unix_timestamp = Clock::get()?.unix_timestamp;
         let game = &mut ctx.accounts.game;
-        game.last_epoch = unix_timestamp as u64;
         let clmm = &ctx.accounts.raydium_clmm;
         let clmm_state = load_raydium_pool_state(clmm)?;
         let price = clmm_state.get_clmm_price().to_num::<u64>();
-        let up_option = ctx.accounts.mint.key() > ctx.accounts.other_mint.key();
-        let option_type = if up_option { "up" } else { "down" };
-        msg!("Option type triggered: {}", option_type);
-    
-        if game.last_price < price && up_option {
-            game.this_mint_won = true;
-            game.this_mint_ate_the_other_already = false;
-        } else if game.last_price > price && !up_option {
-            game.this_mint_won = true;
-            game.this_mint_ate_the_other_already = false;
-        } else {
-            game.this_mint_won = false;
-            game.this_mint_ate_the_other_already = false;
-        }
-    
-        let volatility_index = &mut ctx.accounts.volatility_index;
-        let current_time = unix_timestamp;
-        let index = volatility_index.current_index;
-        // Update only if an hour has passed
-        if current_time - volatility_index.last_update_time >= 3600 {
-            // Update price history
-            volatility_index.price_history[index] = price;
-            volatility_index.current_index = (index + 1) % 24;
-    
-            // Calculate volatility
-            let (min_price, max_price) = volatility_index.price_history.iter()
-                .filter(|&&p| p != 0)
-                .fold((u64::MAX, 0), |(min, max), &p| (min.min(p), max.max(p)));
-    
-            if min_price != u64::MAX && max_price != 0 {
-                volatility_index.volatility = ((max_price - min_price) * 10000) / min_price;
-            }
-    
-            volatility_index.last_update_time = current_time;
-        }
-    
-        // Check if current volatility is above thresholds
-        if volatility_index.volatility > volatility_index.up_threshold {
-            msg!("Volatility is above the up threshold: {}%", volatility_index.volatility as f64 / 100.0);
-        } else if volatility_index.volatility < volatility_index.down_threshold {
-            msg!("Volatility is below the down threshold: {}%", volatility_index.volatility as f64 / 100.0);
-        }
-    
+
+        game.last_price = price;
+
         Ok(())
     }
 
-    
- 
-    // fallback instruction handler as workaround to anchor instruction discriminator check
     pub fn fallback<'info>(
         program_id: &Pubkey,
         accounts: &'info [AccountInfo<'info>],
@@ -369,13 +363,9 @@ pub mod transfer_hook {
     ) -> Result<()> {
         let instruction = TransferHookInstruction::unpack(data)?;
 
-        // match instruction discriminator to transfer hook interface execute instruction  
-        // token2022 program CPIs this instruction on token transfer
         match instruction {
             TransferHookInstruction::Execute { amount } => {
                 let amount_bytes = amount.to_le_bytes();
-
-                // invoke custom transfer hook instruction on our program
                 __private::__global::transfer_hook(program_id, accounts, &amount_bytes)
             }
             _ => return Err(ProgramError::InvalidInstructionData.into()),
@@ -383,21 +373,13 @@ pub mod transfer_hook {
     }
 }
 
-    // Helper function to calculate reward multiplier based on volatility
-    fn calculate_reward_multiplier(current_volatility: u64, up_threshold: u64, down_threshold: u64) -> f64 {
-        if current_volatility > up_threshold {
-            1.0 + ((current_volatility - up_threshold) as f64 / 10000.0) // Increase reward
-        } else if current_volatility < down_threshold {
-            1.0 - ((down_threshold - current_volatility) as f64 / 10000.0) // Decrease reward
-        } else {
-            1.0 // No change in reward
-        }
-    }
+
 #[error_code]
 pub enum TransferHookError {
     #[msg("Invalid CLMM Oracle")]
     InvalidCLMMOracle,
 }
+
 #[derive(Accounts)]
 pub struct OmNomNom<'info> {
     #[account(mut)]
@@ -409,30 +391,27 @@ pub struct OmNomNom<'info> {
     #[account(mut)]
     pub mint: InterfaceAccount<'info, Mint>,
     pub token_program: Program<'info, Token2022>,
-    #[account(
-        mut,
-        seeds = [b"volatility-index", mint.key().as_ref()],
-        bump
-    )]
-    pub volatility_index: Account<'info, VolatilityIndex>,
 }
+
 #[derive(Accounts)]
 pub struct BurnBabyBurn<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut)]
     pub mint: InterfaceAccount<'info, Mint>,
+    #[account(mut)]
+    pub other_mint: InterfaceAccount<'info, Mint>,
     #[account(mut, token::mint = mint)]
     pub mint_ata: InterfaceAccount<'info, TokenAccount>,
     #[account(mut, seeds = [b"game", mint.key().as_ref()], bump)]
     pub game: Account<'info, Game>,
     pub token_program: Program<'info, Token2022>,
-    #[account(
-        mut,
-        seeds = [b"volatility-index", mint.key().as_ref()],
-        bump
-    )]
-    pub volatility_index: Account<'info, VolatilityIndex>,
+    #[account(mut)]
+
+        /// CHECK:
+
+    pub raydium_clmm: AccountInfo<'info>,
+    
 }
 
 #[derive(Accounts)]
@@ -440,12 +419,12 @@ pub struct InitializeExtraAccountMetaList<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    /// CHECK: ExtraAccountMetaList Account, must use these seeds
     #[account(
         mut,
         seeds = [b"extra-account-metas", mint.key().as_ref()], 
         bump
     )]
+    /// CHECK:
     pub extra_account_meta_list: AccountInfo<'info>,
     
     #[account(mut)]
@@ -456,28 +435,16 @@ pub struct InitializeExtraAccountMetaList<'info> {
     #[account(init, payer=payer, space=80, seeds = [b"game", mint.key().as_ref()], bump)]
     pub game: Account<'info, Game>,
     
-    #[account(
-        init,
-        payer = payer,
-        space = 8 + std::mem::size_of::<VolatilityIndex>(),
-        seeds = [b"volatility-index", mint.key().as_ref()],
-        bump
-    )]
-    pub volatility_index: Account<'info, VolatilityIndex>,
     
     pub system_program: Program<'info, System>,
     
-    /// CHECK: Raydium CLMM pool account
+    #[account(mut)]
+        /// CHECK:
+
     pub raydium_clmm: AccountInfo<'info>,
     
     pub token_program: Program<'info, Token2022>,
 }
-
-// Order of accounts matters for this struct.
-// The first 4 accounts are the accounts required for token transfer (source, mint, destination, owner)
-// Remaining accounts are the extra accounts required from the ExtraAccountMetaList account
-// These accounts are provided via CPI to this program from the token2022 program
-
 
 #[derive(Accounts)]
 pub struct TransferHook<'info> {
@@ -491,23 +458,45 @@ pub struct TransferHook<'info> {
         token::mint = mint,
     )]
     pub destination_token: InterfaceAccount<'info, TokenAccount>,
-    /// CHECK: source token account owner, can be SystemAccount or PDA owned by another program
+    /// CHECK:
     pub owner: UncheckedAccount<'info>,
-    /// CHECK: ExtraAccountMetaList Account,
     #[account(
         seeds = [b"extra-account-metas", mint.key().as_ref()], 
         bump
     )]
+    /// CHECK:
     pub extra_account_meta_list: UncheckedAccount<'info>,
     pub other_mint: InterfaceAccount<'info, Mint>,
     #[account(mut, seeds = [b"game", mint.key().as_ref()], bump)]
     pub game: Account<'info, Game>,
+    #[account(mut)]
+        /// CHECK:
+
+    pub raydium_clmm: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct MintSolTokens<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [b"mint"], bump)]
+    pub mint: InterfaceAccount<'info, Mint>,
     #[account(
-        mut,
-        seeds = [b"volatility-index", mint.key().as_ref()],
-        bump
+        init_if_needed,
+        payer = payer,
+        associated_token::mint = mint,
+        associated_token::authority = payer,
     )]
-    pub volatility_index: Account<'info, VolatilityIndex>,
-    /// CHECK: Raydium CLMM pool account
+    pub destination: InterfaceAccount<'info, TokenAccount>,
+    #[account(mut, seeds = [b"game", mint.key().as_ref()], bump)]
+    pub game: Account<'info, Game>,
+    pub token_program: Program<'info, Token2022>,
+    pub system_program: Program<'info, System>,
+    
+    /// CHECK:
+    pub associated_token_program: AccountInfo<'info>,
+    pub rent: Sysvar<'info, Rent>,
+    #[account(mut)]
+    /// CHECK:
     pub raydium_clmm: AccountInfo<'info>,
 }

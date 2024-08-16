@@ -17,10 +17,11 @@ no-idl = []
 no-log-ix-name = []
 
 [dependencies]
-anchor-lang = "0.30.0"
-anchor-spl = "0.30.0"
-fixed = "1.27.0"
+anchor-lang = {version="0.30.1", features=["init-if-needed"]}
+anchor-spl = "0.30.1"
+fixed = "*"
 solana-program = "*"
+spl-stake-pool = "2.0.0"
 spl-tlv-account-resolution = "*"
 spl-token-2022 = {version="3.0.2", features=["no-entrypoint"]}
 spl-transfer-hook-interface = "*"
